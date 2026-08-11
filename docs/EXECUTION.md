@@ -47,17 +47,54 @@ graph TD
     RedisPubSub -->|11b. Sync Cluster Nodes| Broker
 ```
 
+### Full Code-Level Call Trace
+
+```
+1. WebSocket Endpoint Registration
+   └─ WebSocketStompConfig.java (#L38-L48)
+      └─ method: registerStompEndpoints(StompEndpointRegistry registry)
+         └─ sets endpoint "/ws/stomp" with UserHandshakeHandler & SockJS fallback
+
+2. Connection & Handshake Identity Assignment
+   └─ UserHandshakeHandler.java (#L16-L23)
+      └─ method: determineUser(ServerHttpRequest request, WebSocketHandler wsHandler, Map<String, Object> attributes)
+         └─ creates new StompPrincipal(UUID.randomUUID().toString())
+
+3. Inbound Frame Interception & Moderation
+   └─ StompModerationInterceptor.java (#L36-L67)
+      └─ method: preSend(Message<?> message, MessageChannel channel)
+         ├─ extracts byte[] payload & deserializes to ChatMessage
+         ├─ calls AbuseMasterFilter.java (#L35-L60) -> sanitize(String input)
+         └─ returns MessageBuilder.createMessage(cleanBytes, accessor.getMessageHeaders())
+
+4. Controller Mapping & Message Handler
+   └─ ChatController.java (#L37-L51)
+      └─ method: sendPrivateMessage(@Payload ChatMessage chatMessage)
+         ├─ Step A: chatMessageRepository.save(...) -> ChatMessageEntity.java (#L35-L42)
+         │  └─ Persists row to MySQL database
+         └─ Step B: messagingTemplate.convertAndSendToUser(recipient, "/queue/messages", chatMessage)
+            └─ Resolves user session & pushes STOMP MESSAGE frame down client socket
+
+5. Multi-Node Cluster Distribution (Redis Pub/Sub)
+   └─ RedisPubSubService.java (#L37-L45)
+      ├─ method: publishToRedis(String channel, ChatMessage chatMessage)
+      │  └─ converts payload to JSON & publishes to Redis channel
+      └─ method: onMessage(Message message, byte[] pattern) (#L51-L80)
+         └─ listens on Redis channel & relays message to local STOMP subscribers via messagingTemplate
+```
+
 ### Full Request Pipeline Trace
-1. **Connection & Authentication (Handshake):** Client initiates HTTP upgrade request to `/ws/stomp`. `UserHandshakeHandler.determineUser()` generates a unique session `Principal` (UUID username) and attaches it to the WebSocket session.
-2. **Channel Ingress:** Client sends a STOMP frame to `/app/chat.private`, `/app/chat.room/{roomId}`, or `/app/chat.broadcast`. Frame enters Spring's `ClientInboundChannel`.
-3. **Real-time Moderation Interception:** `StompModerationInterceptor.preSend()` catches the incoming frame before any controller mapping. `AbuseMasterFilter` checks text using a character Trie data structure and replaces abusive words with `***`.
-4. **Controller Routing:** Modified clean frame moves to `@MessageMapping` handlers inside [ChatController](file:///Users/rkraj/Desktop/chat-message-app/src/main/java/com/example/chatmessageapp/controller/ChatController.java).
-5. **Database Persistence:** `ChatMessageRepository.save()` translates the DTO to `ChatMessageEntity` and executes an INSERT into MySQL.
+1. **Connection & Authentication (Handshake):** Client initiates HTTP upgrade request to `/ws/stomp`. [`UserHandshakeHandler.determineUser()`](file:///Users/rkraj/Desktop/chat-message-app/src/main/java/com/example/chatmessageapp/config/UserHandshakeHandler.java#L16-L23) generates a unique session `Principal` (UUID username) and attaches it to the WebSocket session.
+2. **Channel Ingress:** Client sends a STOMP frame to `/app/chat.private`, `/app/chat.room/{roomId}`, or `/app/chat.broadcast`. Frame enters Spring's `ClientInboundChannel` registered via [`WebSocketStompConfig.configureClientInboundChannel()`](file:///Users/rkraj/Desktop/chat-message-app/src/main/java/com/example/chatmessageapp/config/WebSocketStompConfig.java#L65-L68).
+3. **Real-time Moderation Interception:** [`StompModerationInterceptor.preSend()`](file:///Users/rkraj/Desktop/chat-message-app/src/main/java/com/example/chatmessageapp/interceptor/StompModerationInterceptor.java#L36-L67) catches the incoming frame before any controller mapping. [`AbuseMasterFilter.sanitize()`](file:///Users/rkraj/Desktop/chat-message-app/src/main/java/com/example/chatmessageapp/moderation/AbuseMasterFilter.java#L35-L60) checks text using a character Trie data structure and replaces abusive words with `***`.
+4. **Controller Routing:** Modified clean frame moves to `@MessageMapping` handlers inside [`ChatController`](file:///Users/rkraj/Desktop/chat-message-app/src/main/java/com/example/chatmessageapp/controller/ChatController.java#L20-L87).
+5. **Database Persistence:** [`ChatMessageRepository.save()`](file:///Users/rkraj/Desktop/chat-message-app/src/main/java/com/example/chatmessageapp/repository/ChatMessageRepository.java#L9) translates the DTO to [`ChatMessageEntity`](file:///Users/rkraj/Desktop/chat-message-app/src/main/java/com/example/chatmessageapp/entity/ChatMessageEntity.java#L9-L43) and executes an INSERT into MySQL.
 6. **Multi-Node Cluster Scaling & Broker Delivery:**
    - **Local Node:** Message is published to `/user/{username}/queue/messages` or `/topic/*` via `SimpMessagingTemplate`.
-   - **Cluster Nodes:** `RedisPubSubService.publishToRedis()` broadcasts the payload across Redis Pub/Sub channels so other application server instances relay the message to their connected users.
+   - **Cluster Nodes:** [`RedisPubSubService.publishToRedis()`](file:///Users/rkraj/Desktop/chat-message-app/src/main/java/com/example/chatmessageapp/redis/RedisPubSubService.java#L37-L45) broadcasts the payload across Redis Pub/Sub channels, and [`RedisPubSubService.onMessage()`](file:///Users/rkraj/Desktop/chat-message-app/src/main/java/com/example/chatmessageapp/redis/RedisPubSubService.java#L51-L80) relays the message to connected users on other application server instances.
 
 ---
+
 
 ## 1. 1-on-1 Direct Messaging (Private DM)
 **Trigger:** Client sends STOMP frame to `/app/chat.private` with JSON body `{ "sender": "alice", "recipient": "bob", "content": "..." }`
