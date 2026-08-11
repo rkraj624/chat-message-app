@@ -1,7 +1,67 @@
 # Execution Flows
 
+## 0. Full End-to-End System Request Architecture & Pipeline
+**Trigger:** Client connects over WebSockets/SockJS, negotiates session identity, sends STOMP frames, passes profanity moderation, persists to MySQL, and scales across nodes via Redis.
+
+```mermaid
+graph TD
+    subgraph Client Layer
+        Browser[Client Web Browser / SockJS]
+    end
+
+    subgraph Network & Ingress Layer
+        WS_Endpoint["/ws/stomp Handshake Endpoint"]
+        HandshakeHandler["UserHandshakeHandler (Principal Assignment)"]
+    end
+
+    subgraph Spring Boot Application Layer
+        InboundChannel["ClientInboundChannel"]
+        Interceptor["StompModerationInterceptor"]
+        TrieFilter["AbuseMasterFilter (Prefix Trie)"]
+        Controller["ChatController (@MessageMapping)"]
+    end
+
+    subgraph Data & Messaging Infrastructure Layer
+        Repo["ChatMessageRepository (Spring Data JPA)"]
+        MySQL[("MySQL Database")]
+        Broker["Simple / STOMP Message Broker"]
+        RedisPubSub["Redis Pub/Sub Channel"]
+    end
+
+    Browser -->|1. HTTP Upgrade / WS Handshake| WS_Endpoint
+    WS_Endpoint -->|2. Generate Random UUID Principal| HandshakeHandler
+    HandshakeHandler -->|3. Establish STOMP Connection| InboundChannel
+    
+    Browser -->|4. Send STOMP Frame /app/*| InboundChannel
+    InboundChannel -->|5. Pre-send Intercept| Interceptor
+    Interceptor -->|6. Check & Mask Content| TrieFilter
+    TrieFilter -->|7. Clean Byte Payload| Controller
+    
+    Controller -->|8. Persist Record| Repo
+    Repo -->|9. SQL Insert| MySQL
+    
+    Controller -->|10a. Convert & Send| Broker
+    Controller -->|10b. Publish Cluster Event| RedisPubSub
+    
+    Broker -->|11a. Deliver to Destination| Browser
+    RedisPubSub -->|11b. Sync Cluster Nodes| Broker
+```
+
+### Full Request Pipeline Trace
+1. **Connection & Authentication (Handshake):** Client initiates HTTP upgrade request to `/ws/stomp`. `UserHandshakeHandler.determineUser()` generates a unique session `Principal` (UUID username) and attaches it to the WebSocket session.
+2. **Channel Ingress:** Client sends a STOMP frame to `/app/chat.private`, `/app/chat.room/{roomId}`, or `/app/chat.broadcast`. Frame enters Spring's `ClientInboundChannel`.
+3. **Real-time Moderation Interception:** `StompModerationInterceptor.preSend()` catches the incoming frame before any controller mapping. `AbuseMasterFilter` checks text using a character Trie data structure and replaces abusive words with `***`.
+4. **Controller Routing:** Modified clean frame moves to `@MessageMapping` handlers inside [ChatController](file:///Users/rkraj/Desktop/chat-message-app/src/main/java/com/example/chatmessageapp/controller/ChatController.java).
+5. **Database Persistence:** `ChatMessageRepository.save()` translates the DTO to `ChatMessageEntity` and executes an INSERT into MySQL.
+6. **Multi-Node Cluster Scaling & Broker Delivery:**
+   - **Local Node:** Message is published to `/user/{username}/queue/messages` or `/topic/*` via `SimpMessagingTemplate`.
+   - **Cluster Nodes:** `RedisPubSubService.publishToRedis()` broadcasts the payload across Redis Pub/Sub channels so other application server instances relay the message to their connected users.
+
+---
+
 ## 1. 1-on-1 Direct Messaging (Private DM)
 **Trigger:** Client sends STOMP frame to `/app/chat.private` with JSON body `{ "sender": "alice", "recipient": "bob", "content": "..." }`
+
 
 ```mermaid
 sequenceDiagram
